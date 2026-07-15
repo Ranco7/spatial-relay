@@ -21,7 +21,6 @@ jobs:
       contents: write
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      RESULT_BUNDLE: ${{ runner.temp }}/SpatialRelayReleaseTests.xcresult
 
     steps:
       - name: Check out tag
@@ -49,7 +48,7 @@ jobs:
             -configuration Debug \
             -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath "$RUNNER_TEMP/TestDerivedData" \
-            -resultBundlePath "$RESULT_BUNDLE" \
+            -resultBundlePath "$RUNNER_TEMP/SpatialRelayReleaseTests.xcresult" \
             ARCHS=arm64 \
             CODE_SIGNING_ALLOWED=NO \
             test
