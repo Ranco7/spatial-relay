@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      RESULT_BUNDLE: ${{ runner.temp }}/SpatialRelayReleaseTests.xcresult
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate tag
+        id: metadata
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Tag must use vMAJOR.MINOR.PATCH, received %s\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "archive=SpatialRelay-$VERSION-arm64.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Test tagged source
+        run: |
+          xcodebuild -quiet \
+            -project SpatialRelay.xcodeproj \
+            -scheme SpatialRelay \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/TestDerivedData" \
+            -resultBundlePath "$RESULT_BUNDLE" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Build and package app
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          OUTPUT_DIR: ${{ runner.temp }}/dist
+          DERIVED_DATA_PATH: ${{ runner.temp }}/ReleaseDerivedData
+        run: Scripts/package-release.sh "$VERSION"
+
+      - name: Upload failed test result
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SpatialRelayReleaseTests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/SpatialRelayReleaseTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Retain release package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SpatialRelay-${{ steps.metadata.outputs.version }}-arm64
+          path: |
+            ${{ runner.temp }}/dist/${{ steps.metadata.outputs.archive }}
+            ${{ runner.temp }}/dist/${{ steps.metadata.outputs.archive }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_PATH: ${{ runner.temp }}/dist/${{ steps.metadata.outputs.archive }}
+          CHECKSUM_PATH: ${{ runner.temp }}/dist/${{ steps.metadata.outputs.archive }}.sha256
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload \
+              "$GITHUB_REF_NAME" \
+              "$ARCHIVE_PATH" \
+              "$CHECKSUM_PATH" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create \
+              "$GITHUB_REF_NAME" \
+              "$ARCHIVE_PATH#Spatial Relay for Apple silicon" \
+              "$CHECKSUM_PATH#SHA-256 checksum" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "Spatial Relay $GITHUB_REF_NAME"
+          fi

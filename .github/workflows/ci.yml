@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      DERIVED_DATA: ${{ runner.temp }}/SpatialRelayDerivedData
+      RESULT_BUNDLE: ${{ runner.temp }}/SpatialRelayTests.xcresult
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Run unit tests
+        run: |
+          xcodebuild -quiet \
+            -project SpatialRelay.xcodeproj \
+            -scheme SpatialRelay \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RESULT_BUNDLE" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Run static analysis
+        run: |
+          xcodebuild -quiet \
+            -project SpatialRelay.xcodeproj \
+            -scheme SpatialRelay \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            analyze
+
+      - name: Build Release configuration
+        run: |
+          xcodebuild -quiet \
+            -project SpatialRelay.xcodeproj \
+            -scheme SpatialRelay \
+            -configuration Release \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          lipo \
+            "$DERIVED_DATA/Build/Products/Release/SpatialRelay.app/Contents/MacOS/SpatialRelay" \
+            -verify_arch arm64
+
+      - name: Upload failed test result
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SpatialRelayTests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/SpatialRelayTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
