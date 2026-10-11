@@ -24,6 +24,7 @@ cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/LICENSE" "$RELAY_PACKAGE_DIR/"
 mkdir -p "$RELAY_PACKAGE_DIR/Scripts"
 cp "$PROJECT_DIR/Scripts/paths.sh" "$PROJECT_DIR/Scripts/install.sh" "$PROJECT_DIR/Scripts/uninstall.sh" "$RELAY_PACKAGE_DIR/Scripts/"
 ditto "$PROJECT_DIR/Configuration" "$RELAY_PACKAGE_DIR/Configuration"
+ditto "$PROJECT_DIR/env" "$RELAY_PACKAGE_DIR/env"
 ditto "$PROJECT_DIR/LaunchAgents" "$RELAY_PACKAGE_DIR/LaunchAgents"
 chmod +x "$RELAY_PACKAGE_DIR/"*.command "$RELAY_PACKAGE_DIR/Scripts/"*.sh
 ditto -c -k --sequesterRsrc --keepParent "$RELAY_PACKAGE_DIR" "$RELAY_DIST_DIR/SpatialRelay-0.3.0-arm64.zip"

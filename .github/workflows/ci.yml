@@ -54,6 +54,7 @@ jobs:
           set -euo pipefail
           PACKAGE="$RUNNER_TEMP/dist/SpatialRelay"
           BINARY="$PACKAGE/SpatialRelay.app/Contents/MacOS/SpatialRelay"
+          test -f "$PACKAGE/env/environment.md"
           "$BINARY" --help
           "$BINARY" --diagnose > "$RUNNER_TEMP/diagnosis.json"
           "$BINARY" --check-config --config "$PACKAGE/Configuration/config.json"
@@ -73,14 +74,29 @@ jobs:
           wait "$RELAY_TEST_PID"
           trap - EXIT
           for script in Scripts/*.sh *.command; do bash -n "$script"; done
-          export SPATIAL_RELAY_SUPPORT_DIR="$RUNNER_TEMP/InstallTest/Support"
+          export SPATIAL_RELAY_SUPPORT_DIR="$RUNNER_TEMP/InstallTest/Application Support"
           export SPATIAL_RELAY_AGENT_DIR="$RUNNER_TEMP/InstallTest/Agents"
           export SPATIAL_RELAY_TRASH_DIR="$RUNNER_TEMP/InstallTest/Trash"
           export SPATIAL_RELAY_INSTALL_TEST_ONLY=1
           bash "$PACKAGE/Scripts/install.sh"
           test -x "$SPATIAL_RELAY_SUPPORT_DIR/SpatialRelay.app/Contents/MacOS/SpatialRelay"
           if bash "$PACKAGE/Scripts/install.sh"; then exit 1; fi
+          RELAY_TEST_AGENT="$SPATIAL_RELAY_AGENT_DIR/com.ranco7.SpatialRelay.plist"
+          RELAY_TEST_DOMAIN="gui/$(id -u)/com.ranco7.SpatialRelay"
+          # Use an absent target even if the cloud runner ever gains an audio route.
+          /usr/libexec/PlistBuddy -c "Add :ProgramArguments:1 string --config" "$RELAY_TEST_AGENT"
+          /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $RUNNER_TEMP/idle-config.json" "$RELAY_TEST_AGENT"
+          trap 'launchctl bootout "$RELAY_TEST_DOMAIN" 2>/dev/null || true' EXIT
+          launchctl bootstrap "gui/$(id -u)" "$RELAY_TEST_AGENT"
+          sleep 3
+          launchctl print "$RELAY_TEST_DOMAIN" > "$RUNNER_TEMP/launch-agent-state.txt"
+          RELAY_TEST_AGENT_PID="$(awk '/pid = / {print $3; exit}' "$RUNNER_TEMP/launch-agent-state.txt")"
+          test -n "$RELAY_TEST_AGENT_PID"
+          kill -0 "$RELAY_TEST_AGENT_PID"
+          export SPATIAL_RELAY_INSTALL_TEST_ONLY=0
           bash "$PACKAGE/Scripts/uninstall.sh"
+          if launchctl print "$RELAY_TEST_DOMAIN" >/dev/null 2>&1; then exit 1; fi
+          trap - EXIT
           test ! -e "$SPATIAL_RELAY_SUPPORT_DIR"
           test -d "$SPATIAL_RELAY_TRASH_DIR"
       - name: Upload evidence and executable package
@@ -93,6 +109,7 @@ jobs:
             ${{ runner.temp }}/dist/*.sha256
             ${{ runner.temp }}/diagnosis.json
             ${{ runner.temp }}/idle-status.json
+            ${{ runner.temp }}/launch-agent-state.txt
             ${{ runner.temp }}/Tests.xcresult
           if-no-files-found: warn
           retention-days: 30
