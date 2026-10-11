@@ -216,6 +216,10 @@ final class BackgroundRelay: @unchecked Sendable {
     }
 
     private func fail(_ error: Error) {
+        if case RelayError.cleanupFailed = error {
+            logger.error("\(error.localizedDescription, privacy: .public)")
+            exit(1)
+        }
         stopPipeline()
         let delay = retry.nextDelay()
         retryAfter = ProcessInfo.processInfo.systemUptime + delay

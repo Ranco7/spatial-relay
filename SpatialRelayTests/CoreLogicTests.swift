@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreAudio
 import CoreMedia
 import XCTest
@@ -64,6 +65,12 @@ final class CoreLogicTests: XCTestCase {
             XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(sample), .zero)
         }
         XCTAssertThrowsError(try PCMSampleBufferFactory(sampleRate: 48_000, channelCount: 6, channelLayout: nil))
+    }
+
+    func testNativeRendererAllowsAllSpatializationFormats() {
+        let renderer = AVSampleBufferAudioRenderer()
+        renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
+        XCTAssertEqual(renderer.allowedAudioSpatializationFormats, .monoStereoAndMultichannel)
     }
 
     func testMonoAndSixChannelRingPreserveEveryByte() throws {
