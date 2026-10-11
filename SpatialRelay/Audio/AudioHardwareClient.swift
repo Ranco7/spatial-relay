@@ -124,7 +124,8 @@ final class AudioHardwareClient {
             let applicationName = application?.localizedName ?? ""
 
             guard pid > 0, pid != getpid() else { return nil }
-            var pathBytes = [CChar](repeating: 0, count: Int(PROC_PIDPATHINFO_MAXSIZE))
+            // libproc defines this capacity as 4 * MAXPATHLEN; Swift cannot import that expression macro.
+            var pathBytes = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
             let pathLength = pathBytes.withUnsafeMutableBytes {
                 proc_pidpath(pid, $0.baseAddress, UInt32($0.count))
             }
