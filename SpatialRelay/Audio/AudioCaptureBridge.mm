@@ -241,7 +241,7 @@ OSStatus configureStreamUsage(AudioObjectID device, AudioDeviceIOProcID ioProc,
     OSStatus status = AudioObjectGetPropertyDataSize(device, &address, 0, nullptr, &size);
     if (status != noErr) return status;
     const UInt32 count = size / sizeof(AudioStreamID);
-    if (count == 0) return finalInputOnly ? kAudioHardwareBadStreamError : noErr;
+    if (count == 0) return finalInputOnly ? static_cast<OSStatus>(kAudioHardwareBadStreamError) : static_cast<OSStatus>(noErr);
     const size_t usageSize = offsetof(AudioHardwareIOProcStreamUsage, mStreamIsOn) +
         static_cast<size_t>(count) * sizeof(UInt32);
     std::vector<std::max_align_t> memory((usageSize + sizeof(std::max_align_t) - 1) /

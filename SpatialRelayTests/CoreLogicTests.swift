@@ -103,10 +103,10 @@ final class CoreLogicTests: XCTestCase {
             right.withUnsafeMutableBytes { r in
                 buffers[1] = AudioBuffer(mNumberChannels: 1, mDataByteSize: 8, mData: l.baseAddress)
                 buffers[2] = AudioBuffer(mNumberChannels: 1, mDataByteSize: 8, mData: r.baseAddress)
-                bridge.debugEnqueueBufferList(list)
+                bridge.debugEnqueue(list)
                 // Any enabled physical input invalidates the entire callback.
                 buffers[0].mData = l.baseAddress
-                bridge.debugEnqueueBufferList(list)
+                bridge.debugEnqueue(list)
             }
         }
         let chunk = try XCTUnwrap(bridge.dequeueChunk(withMaximumFrameCount: 4))

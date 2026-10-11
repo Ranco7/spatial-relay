@@ -203,18 +203,18 @@ final class AudioHardwareClient {
         var address = propertyAddress(kAudioTapPropertyDescription)
         var description: CATapDescription?
         var size = UInt32(MemoryLayout<CATapDescription?>.size)
-        try CoreAudioFailure.check(
-            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &description),
-            operation: "读取应用捕获描述"
-        )
+        let readStatus = withUnsafeMutablePointer(to: &description) {
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, $0)
+        }
+        try CoreAudioFailure.check(readStatus, operation: "读取应用捕获描述")
         guard let description else { throw RelayError.captureFailed("捕获描述已失效") }
         description.processes = processes.map(\.id)
         description.isExclusive = false
         var updated: CATapDescription? = description
-        try CoreAudioFailure.check(
-            AudioObjectSetPropertyData(tapID, &address, 0, nil, size, &updated),
-            operation: "更新应用及辅助进程"
-        )
+        let writeStatus = withUnsafePointer(to: &updated) {
+            AudioObjectSetPropertyData(tapID, &address, 0, nil, size, $0)
+        }
+        try CoreAudioFailure.check(writeStatus, operation: "更新应用及辅助进程")
     }
 
     func channelLayout(output: OutputDeviceInfo, channels: UInt32) throws -> Data? {
@@ -300,7 +300,7 @@ final class AudioHardwareClient {
             )
             guard streamFormat.mSampleRate == tapFormat.mSampleRate,
                   streamFormat.mFormatID == tapFormat.mFormatID,
-                  streamFormat.mFormatFlags == tapFormat.mFormatFlags,
+                  (streamFormat.mFormatFlags & ~kAudioFormatFlagIsNonMixable) == (tapFormat.mFormatFlags & ~kAudioFormatFlagIsNonMixable),
                   streamFormat.mBytesPerPacket == tapFormat.mBytesPerPacket,
                   streamFormat.mFramesPerPacket == tapFormat.mFramesPerPacket,
                   streamFormat.mBytesPerFrame == tapFormat.mBytesPerFrame,
