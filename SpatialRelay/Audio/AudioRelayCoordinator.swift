@@ -83,7 +83,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 )
             }
             let uid = try hardware.tapUID(tapID)
-            aggregateID = try hardware.createAggregateDevice(tapUID: uid, output: output)
+            aggregateID = try hardware.createAggregateDevice(tapUID: uid, tapFormat: format, output: output)
 
             let callbackGeneration = generation
             let capture = SRAudioCaptureBridge()

@@ -121,6 +121,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
             synchronizer.addRenderer(renderer)
             synchronizer.setRate(0, time: .zero)
+            pauseTransitionStartTime = .now()
 
             installRendererObservers()
 
@@ -211,11 +212,12 @@ final class SampleBufferPlayer: @unchecked Sendable {
             return
         }
 
-        // setRate(_:time:) completes asynchronously. Keep new PCM in the ring
-        // until the synchronizer confirms it is paused, rather than relying on
-        // a fixed delay under load.
+        // The rate property changes immediately; the underlying timebase changes
+        // asynchronously. Wait for its actual rate and requested position before
+        // enqueueing PCM on the new timeline.
         if let pauseTransitionStartTime {
-            if abs(synchronizer.rate) < 0.000_1 {
+            if abs(CMTimebaseGetRate(synchronizer.timebase)) < 0.000_1,
+               CMTimeCompare(CMTimebaseGetTime(synchronizer.timebase), mediaTime(forFrame: segmentStartFrame)) == 0 {
                 self.pauseTransitionStartTime = nil
             } else if elapsedMilliseconds(since: pauseTransitionStartTime) > OutputReconfigurationGrace.durationMilliseconds {
                 deliverFailure(RelayError.rendererFailed("the render timeline did not pause"))
@@ -227,7 +229,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
         if rendererRecoveryIsActive,
            timelineIsRunning,
-           abs(synchronizer.rate - 1) < 0.000_1 {
+           abs(CMTimebaseGetRate(synchronizer.timebase) - 1) < 0.000_1 {
             rendererRecoveryIsActive = false
         }
 
@@ -389,8 +391,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private func deliverFailure(_ error: Error) {
         guard !failureWasDelivered else { return }
         failureWasDelivered = true
-        // Do not wait for the main actor to tear down the UI. Stopping the IOProc
-        // here immediately releases mutedWhenTapped during renderer failures.
+        // Pause playback immediately while the coordinator restores direct output.
         synchronizer.setRate(0, time: .invalid)
         renderer.flush()
         // The coordinator alone owns IOProc teardown; concurrent stops from two

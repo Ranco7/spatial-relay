@@ -175,6 +175,9 @@ final class AudioHardwareClient {
     }
 
     func createTargetTap(processes: [AudioProcessInfo], outputDevice: OutputDeviceInfo) throws -> AudioObjectID {
+        guard try streams(outputDevice.id, scope: kAudioDevicePropertyScopeOutput).count == 1 else {
+            throw RelayError.unsupportedTapFormat("输出设备有多个硬件音频流，首版无法完整接管")
+        }
         let description = CATapDescription()
         description.name = "空间音频桥 — 指定应用"
         description.processes = processes.map(\.id)
@@ -248,7 +251,7 @@ final class AudioHardwareClient {
         return format
     }
 
-    func createAggregateDevice(tapUID: String, output: OutputDeviceInfo) throws -> AudioObjectID {
+    func createAggregateDevice(tapUID: String, tapFormat: AudioStreamBasicDescription, output: OutputDeviceInfo) throws -> AudioObjectID {
         let aggregateUID = "com.ranco7.SpatialRelay.aggregate.\(UUID().uuidString)"
         let tapEntry: [String: Any] = [
             kAudioSubTapUIDKey: tapUID,
@@ -280,6 +283,29 @@ final class AudioHardwareClient {
             let aggregateRate = try readDouble(aggregateID, selector: kAudioDevicePropertyNominalSampleRate)
             guard abs(aggregateRate - output.sampleRate) <= 0.5 else {
                 throw RelayError.unsupportedTapFormat("捕获聚合设备与耳机采样率不一致")
+            }
+            let physicalInputs = try streams(output.id, scope: kAudioDevicePropertyScopeInput)
+            let aggregateInputs = try streams(aggregateID, scope: kAudioDevicePropertyScopeInput)
+            guard aggregateInputs.count == physicalInputs.count + 1,
+                  let tapStream = aggregateInputs.last else {
+                throw RelayError.unsupportedTapFormat("聚合设备没有按预期提供唯一的应用捕获流")
+            }
+            var address = propertyAddress(kAudioStreamPropertyVirtualFormat)
+            var streamFormat = AudioStreamBasicDescription()
+            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            try CoreAudioFailure.check(
+                AudioObjectGetPropertyData(tapStream, &address, 0, nil, &size, &streamFormat),
+                operation: "校验捕获流格式"
+            )
+            guard streamFormat.mSampleRate == tapFormat.mSampleRate,
+                  streamFormat.mFormatID == tapFormat.mFormatID,
+                  streamFormat.mFormatFlags == tapFormat.mFormatFlags,
+                  streamFormat.mBytesPerPacket == tapFormat.mBytesPerPacket,
+                  streamFormat.mFramesPerPacket == tapFormat.mFramesPerPacket,
+                  streamFormat.mBytesPerFrame == tapFormat.mBytesPerFrame,
+                  streamFormat.mChannelsPerFrame == tapFormat.mChannelsPerFrame,
+                  streamFormat.mBitsPerChannel == tapFormat.mBitsPerChannel else {
+                throw RelayError.unsupportedTapFormat("聚合设备改变了应用捕获流格式，停止接管")
             }
         } catch {
             let status = AudioHardwareDestroyAggregateDevice(aggregateID)
@@ -324,6 +350,25 @@ final class AudioHardwareClient {
         return withUnsafePointer(to: &updatedDescription) { pointer in
             AudioObjectSetPropertyData(tapID, &address, 0, nil, byteCount, pointer)
         }
+    }
+
+    private func streams(_ device: AudioObjectID, scope: AudioObjectPropertyScope) throws -> [AudioStreamID] {
+        var address = propertyAddress(kAudioDevicePropertyStreams, scope: scope)
+        var size: UInt32 = 0
+        try CoreAudioFailure.check(
+            AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size),
+            operation: "读取硬件音频流数量"
+        )
+        guard size % UInt32(MemoryLayout<AudioStreamID>.stride) == 0 else {
+            throw RelayError.unsupportedTapFormat("硬件音频流列表无效")
+        }
+        guard size > 0 else { return [] }
+        var streams = [AudioStreamID](repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.stride)
+        let status = streams.withUnsafeMutableBytes {
+            AudioObjectGetPropertyData(device, &address, 0, nil, &size, $0.baseAddress!)
+        }
+        try CoreAudioFailure.check(status, operation: "读取硬件音频流")
+        return Array(streams.prefix(Int(size) / MemoryLayout<AudioStreamID>.stride))
     }
 
     private func readPID(_ objectID: AudioObjectID) throws -> pid_t {
