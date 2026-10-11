@@ -75,6 +75,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
         capture: SRAudioCaptureBridge,
         sampleRate: Double,
         outputDeviceUID: String,
+        channelCount: UInt32,
+        channelLayout: Data?,
         onFailure: @escaping FailureHandler
     ) throws {
         let roundedRate = sampleRate.rounded()
@@ -85,7 +87,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         self.sampleRate = sampleRate
         self.timeScale = CMTimeScale(roundedRate)
         self.onFailure = onFailure
-        self.factory = try PCMSampleBufferFactory(sampleRate: sampleRate)
+        self.factory = try PCMSampleBufferFactory(sampleRate: sampleRate, channelCount: channelCount, channelLayout: channelLayout)
         self.prebufferFrameCount = max(2_048, Int64(sampleRate * 0.08))
         renderer.audioOutputDeviceUniqueID = outputDeviceUID
         serializationQueue.setSpecific(key: queueKey, value: 1)
@@ -114,7 +116,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
             // Audio-only renderers default to multichannel spatialization. This explicit
             // opt-in is what makes ordinary two-channel PCM eligible for Spatialize Stereo.
-            renderer.allowedAudioSpatializationFormats = .monoAndStereo
+            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
             renderer.volume = 1
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
             synchronizer.addRenderer(renderer)
@@ -179,7 +181,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         if renderer.status == .failed {
             // AVQueuedSampleBufferRenderingStatus.failed is terminal. Normal
             // spatial-output changes are handled by the notifications below;
-            // retaining Spotify's muted tap for five seconds cannot recover a
+            // retaining 目标应用's muted tap for five seconds cannot recover a
             // renderer that has actually entered this state.
             deliverFailure(RelayError.rendererFailed(renderer.error?.localizedDescription ?? "unknown renderer error"))
             return
@@ -229,7 +231,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             rendererRecoveryIsActive = false
         }
 
-        // If the control queue was delayed while Spotify was silent, the
+        // If the control queue was delayed while 目标应用 was silent, the
         // synchronizer may already be beyond the last queued frame when audio
         // resumes. Rebase before enqueueing so new PCM is never timestamped in
         // the past.
@@ -288,7 +290,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
         // The ring is normally empty while the renderer stays prebuffered. When
         // its playhead actually reaches the final queued sample, freeze there;
-        // this handles even very short Spotify pauses without creating late PTS.
+        // this handles even very short 目标应用 pauses without creating late PTS.
         if timelineIsRunning, capture.availableFrameCount == 0 {
             let playhead = synchronizer.currentTime()
             let queuedEnd = mediaTime(forFrame: nextFrame)
@@ -389,7 +391,10 @@ final class SampleBufferPlayer: @unchecked Sendable {
         failureWasDelivered = true
         // Do not wait for the main actor to tear down the UI. Stopping the IOProc
         // here immediately releases mutedWhenTapped during renderer failures.
-        try? capture.stop()
+        synchronizer.setRate(0, time: .invalid)
+        renderer.flush()
+        // The coordinator alone owns IOProc teardown; concurrent stops from two
+        // queues could free callback storage while the HAL still references it.
         onFailure(error)
     }
 
@@ -412,40 +417,56 @@ final class SampleBufferPlayer: @unchecked Sendable {
     }
 }
 
-private final class PCMSampleBufferFactory {
+final class PCMSampleBufferFactory {
     private let formatDescription: CMAudioFormatDescription
     private let timescale: CMTimeScale
+    private let bytesPerFrame: Int
 
-    init(sampleRate: Double) throws {
+    init(sampleRate: Double, channelCount: UInt32, channelLayout: Data?) throws {
         let roundedRate = sampleRate.rounded()
         guard roundedRate > 0, roundedRate <= Double(Int32.max) else {
             throw RelayError.unsupportedTapFormat("invalid sample rate \(sampleRate)")
         }
+        guard (1...32).contains(channelCount), channelCount <= 2 || channelLayout != nil else {
+            throw RelayError.unsupportedTapFormat("多声道必须有输出设备提供的真实声道布局")
+        }
         timescale = CMTimeScale(roundedRate)
+        bytesPerFrame = Int(channelCount) * MemoryLayout<Float>.size
 
         var format = AudioStreamBasicDescription(
             mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian,
-            mBytesPerPacket: 8,
+            mBytesPerPacket: channelCount * 4,
             mFramesPerPacket: 1,
-            mBytesPerFrame: 8,
-            mChannelsPerFrame: 2,
+            mBytesPerFrame: channelCount * 4,
+            mChannelsPerFrame: channelCount,
             mBitsPerChannel: 32,
             mReserved: 0
         )
         var description: CMAudioFormatDescription?
-        let status = CMAudioFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            asbd: &format,
-            layoutSize: 0,
-            layout: nil,
-            magicCookieSize: 0,
-            magicCookie: nil,
-            extensions: nil,
-            formatDescriptionOut: &description
-        )
-        try CoreAudioFailure.check(status, operation: "Creating the stereo PCM description")
+        let createDescription: (UnsafePointer<AudioChannelLayout>?, Int) -> OSStatus = { layout, size in
+            CMAudioFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                asbd: &format,
+                layoutSize: size,
+                layout: layout,
+                magicCookieSize: 0,
+                magicCookie: nil,
+                extensions: nil,
+                formatDescriptionOut: &description
+            )
+        }
+        let status: OSStatus
+        if let channelLayout {
+            status = channelLayout.withUnsafeBytes { bytes in
+                createDescription(bytes.baseAddress?.assumingMemoryBound(to: AudioChannelLayout.self), bytes.count)
+            }
+        } else {
+            status = createDescription(nil, 0)
+        }
+        try CoreAudioFailure.check(status, operation: "创建原始 PCM 格式描述")
+
         guard let description else {
             throw RelayError.unsupportedTapFormat("Core Media rejected the PCM description")
         }
@@ -457,7 +478,7 @@ private final class PCMSampleBufferFactory {
         frameCount: UInt32,
         startingAtFrame: Int64
     ) throws -> CMSampleBuffer {
-        guard frameCount > 0, data.count == Int(frameCount) * 8 else {
+        guard frameCount > 0, data.count == Int(frameCount) * bytesPerFrame else {
             throw RelayError.captureFailed("an incomplete PCM chunk was received")
         }
 

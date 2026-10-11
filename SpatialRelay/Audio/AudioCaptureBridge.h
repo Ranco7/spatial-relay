@@ -42,6 +42,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable SRPCMChunk *)dequeueChunkWithMaximumFrameCount:(UInt32)maximumFrameCount;
 
 #if DEBUG
+- (void)debugConfigureChannels:(UInt32)channels planar:(BOOL)planar tapBufferOffset:(UInt32)offset;
+- (void)debugEnqueueBufferList:(const AudioBufferList *)buffers;
+
 /// Deterministic unit-test hook. Never used by the app's relay path.
 - (void)debugEnqueueInterleavedFloatData:(NSData *)data;
 #endif

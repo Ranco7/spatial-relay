@@ -1,6 +1,7 @@
 import AppKit
 import CoreAudio
 import Foundation
+import Darwin
 
 struct AudioProcessInfo: Equatable, Identifiable, Sendable {
     let id: AudioObjectID
@@ -24,26 +25,80 @@ struct OutputDeviceInfo: Equatable, Sendable {
     }
 }
 
-enum SpotifyProcessMatcher {
-    static func matches(bundleIdentifier: String, applicationName: String) -> Bool {
-        let bundle = bundleIdentifier
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if !bundle.isEmpty {
-            return bundle == "com.spotify.client" || bundle.hasPrefix("com.spotify.client.")
-        }
 
-        // Older Core Audio process objects may not expose a bundle identifier.
-        // Only then fall back to the application name.
-        let name = applicationName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return name == "spotify" || name.hasPrefix("spotify helper")
+struct RelayConfiguration: Codable, Equatable, Sendable {
+    var targetBundleIDs: [String] = ["com.netease.163music", "com.google.Chrome"]
+    // A renamed AirPods device can be selected by its stable UID.
+    var outputDeviceUID: String? = nil
+
+    func validated() throws -> RelayConfiguration {
+        guard !targetBundleIDs.isEmpty, targetBundleIDs.count <= 16,
+              targetBundleIDs.allSatisfy({ id in
+                  id == id.trimmingCharacters(in: .whitespacesAndNewlines) &&
+                  id.contains(".") && !id.hasPrefix(".") && !id.hasSuffix(".") &&
+                  id.unicodeScalars.allSatisfy {
+                      CharacterSet.alphanumerics.contains($0) || $0 == "." || $0 == "-"
+                  } &&
+                  !id.lowercased().hasPrefix("com.ranco7.spatialrelay")
+              }),
+              outputDeviceUID == nil || !(outputDeviceUID?.isEmpty ?? true) else {
+            throw RelayError.configuration("目标应用标识或输出设备 UID 无效")
+        }
+        return self
+    }
+
+    static func read(_ url: URL) throws -> RelayConfiguration {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return RelayConfiguration()
+        }
+        // Reject misspelled keys rather than unexpectedly using a default target.
+        let data = try Data(contentsOf: url)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any],
+              Set(dictionary.keys).isSubset(of: ["targetBundleIDs", "outputDeviceUID"]),
+              dictionary["targetBundleIDs"] != nil else {
+            throw RelayError.configuration("JSON 配置必须包含 targetBundleIDs，且不能有未知字段")
+        }
+        return try JSONDecoder().decode(RelayConfiguration.self, from: data).validated()
+    }
+}
+
+enum AppFamilyMatcher {
+    static func matches(
+        bundleIdentifier: String,
+        owningAppBundleIdentifier: String?,
+        targets: [String]
+    ) -> Bool {
+        let allowed = Set(targets.map { $0.lowercased() })
+        // The outer .app identifies helpers even if they use a different bundle ID.
+        // A known different owner must never be overridden by a matching name.
+        if let owner = owningAppBundleIdentifier, !owner.isEmpty {
+            return allowed.contains(owner.lowercased())
+        }
+        let bundle = bundleIdentifier.lowercased()
+        guard !bundle.isEmpty else { return false }
+        return allowed.contains { bundle == $0 || bundle.hasPrefix($0 + ".") }
+    }
+
+    static func outerAppURL(executablePath: String) -> URL? {
+        let parts = URL(fileURLWithPath: executablePath).standardized.pathComponents
+        guard let index = parts.firstIndex(where: { $0.lowercased().hasSuffix(".app") }) else {
+            return nil
+        }
+        return URL(fileURLWithPath: NSString.path(withComponents: Array(parts[...index])))
     }
 }
 
 final class AudioHardwareClient {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
-    func spotifyProcesses() throws -> [AudioProcessInfo] {
+    let configuration: RelayConfiguration
+
+    init(configuration: RelayConfiguration = RelayConfiguration()) {
+        self.configuration = configuration
+    }
+
+    func targetProcesses() throws -> [AudioProcessInfo] {
         var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
         var byteCount: UInt32 = 0
         try CoreAudioFailure.check(
@@ -68,18 +123,25 @@ final class AudioHardwareClient {
             let bundleID = coreAudioBundleID.isEmpty ? (application?.bundleIdentifier ?? "") : coreAudioBundleID
             let applicationName = application?.localizedName ?? ""
 
-            guard SpotifyProcessMatcher.matches(
-                bundleIdentifier: bundleID,
-                applicationName: applicationName
-            ) else {
-                return nil
+            guard pid > 0, pid != getpid() else { return nil }
+            var pathBytes = [CChar](repeating: 0, count: Int(PROC_PIDPATHINFO_MAXSIZE))
+            let pathLength = pathBytes.withUnsafeMutableBytes {
+                proc_pidpath(pid, $0.baseAddress, UInt32($0.count))
             }
+            let path = pathLength > 0 ? String(cString: pathBytes) : ""
+            let owner = AppFamilyMatcher.outerAppURL(executablePath: path)
+                .flatMap { Bundle(url: $0)?.bundleIdentifier }
+            guard AppFamilyMatcher.matches(
+                bundleIdentifier: bundleID,
+                owningAppBundleIdentifier: owner,
+                targets: configuration.targetBundleIDs
+            ) else { return nil }
 
             return AudioProcessInfo(
                 id: objectID,
                 pid: pid,
                 bundleIdentifier: bundleID,
-                applicationName: applicationName.isEmpty ? "Spotify" : applicationName,
+                applicationName: applicationName.isEmpty ? bundleID : applicationName,
                 isRunningOutput: (try? readBool(objectID, selector: kAudioProcessPropertyIsRunningOutput)) ?? false
             )
         }
@@ -112,13 +174,13 @@ final class AudioHardwareClient {
         )
     }
 
-    func createSpotifyTap(processes: [AudioProcessInfo], outputDevice: OutputDeviceInfo) throws -> AudioObjectID {
+    func createTargetTap(processes: [AudioProcessInfo], outputDevice: OutputDeviceInfo) throws -> AudioObjectID {
         let description = CATapDescription()
-        description.name = "Spatial Relay — Spotify"
+        description.name = "空间音频桥 — 指定应用"
         description.processes = processes.map(\.id)
         description.isPrivate = true
         description.isExclusive = false
-        description.isMixdown = true
+        description.isMixdown = false
         description.isMono = false
         description.muteBehavior = .mutedWhenTapped
         description.deviceUID = outputDevice.uid
@@ -127,9 +189,48 @@ final class AudioHardwareClient {
         var tapID = AudioObjectID(kAudioObjectUnknown)
         try CoreAudioFailure.check(
             AudioHardwareCreateProcessTap(description, &tapID),
-            operation: "Creating the Spotify process tap"
+            operation: "创建指定应用的音频捕获"
         )
         return tapID
+    }
+
+    func updateTapProcesses(_ tapID: AudioObjectID, processes: [AudioProcessInfo]) throws {
+        guard !processes.isEmpty else { throw RelayError.targetNotRunning }
+        var address = propertyAddress(kAudioTapPropertyDescription)
+        var description: CATapDescription?
+        var size = UInt32(MemoryLayout<CATapDescription?>.size)
+        try CoreAudioFailure.check(
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &description),
+            operation: "读取应用捕获描述"
+        )
+        guard let description else { throw RelayError.captureFailed("捕获描述已失效") }
+        description.processes = processes.map(\.id)
+        description.isExclusive = false
+        var updated: CATapDescription? = description
+        try CoreAudioFailure.check(
+            AudioObjectSetPropertyData(tapID, &address, 0, nil, size, &updated),
+            operation: "更新应用及辅助进程"
+        )
+    }
+
+    func channelLayout(output: OutputDeviceInfo, channels: UInt32) throws -> Data? {
+        guard channels > 2 else { return nil }
+        var address = propertyAddress(kAudioDevicePropertyPreferredChannelLayout, scope: kAudioDevicePropertyScopeOutput)
+        var size: UInt32 = 0
+        try CoreAudioFailure.check(
+            AudioObjectGetPropertyDataSize(output.id, &address, 0, nil, &size),
+            operation: "读取多声道布局大小"
+        )
+        guard size >= MemoryLayout<AudioChannelLayout>.size, size <= 65_536 else {
+            throw RelayError.unsupportedTapFormat("输出设备未提供可用的多声道布局")
+        }
+        var data = Data(count: Int(size))
+        let status = data.withUnsafeMutableBytes {
+            AudioObjectGetPropertyData(output.id, &address, 0, nil, &size, $0.baseAddress!)
+        }
+        try CoreAudioFailure.check(status, operation: "读取多声道布局")
+        data.count = Int(size)
+        return data
     }
 
     func tapUID(_ tapID: AudioObjectID) throws -> String {
@@ -147,14 +248,19 @@ final class AudioHardwareClient {
         return format
     }
 
-    func createAggregateDevice(tapUID: String) throws -> AudioObjectID {
-        let aggregateUID = "com.shevlfs.SpatialRelay.aggregate.\(UUID().uuidString)"
+    func createAggregateDevice(tapUID: String, output: OutputDeviceInfo) throws -> AudioObjectID {
+        let aggregateUID = "com.ranco7.SpatialRelay.aggregate.\(UUID().uuidString)"
         let tapEntry: [String: Any] = [
             kAudioSubTapUIDKey: tapUID,
-            kAudioSubTapDriftCompensationKey: true
+            kAudioSubTapDriftCompensationKey: false
         ]
         let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "Spatial Relay Capture",
+            kAudioAggregateDeviceNameKey: "空间音频桥捕获",
+            kAudioAggregateDeviceSubDeviceListKey: [[
+                kAudioSubDeviceUIDKey: output.uid,
+                kAudioSubDeviceDriftCompensationKey: false
+            ]],
+            kAudioAggregateDeviceMainSubDeviceKey: output.uid,
             kAudioAggregateDeviceUIDKey: aggregateUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceTapListKey: [tapEntry]
@@ -165,6 +271,23 @@ final class AudioHardwareClient {
             AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateID),
             operation: "Creating the private tap device"
         )
+        // A separate free-running capture clock would accumulate drift against
+        // AVFoundation's physical output. Verify that HAL accepted the output as master.
+        do {
+            guard try readString(aggregateID, selector: kAudioAggregateDevicePropertyMainSubDevice) == output.uid else {
+                throw RelayError.captureFailed("系统没有采用输出设备作为捕获时钟源")
+            }
+            let aggregateRate = try readDouble(aggregateID, selector: kAudioDevicePropertyNominalSampleRate)
+            guard abs(aggregateRate - output.sampleRate) <= 0.5 else {
+                throw RelayError.unsupportedTapFormat("捕获聚合设备与耳机采样率不一致")
+            }
+        } catch {
+            let status = AudioHardwareDestroyAggregateDevice(aggregateID)
+            guard status == noErr else {
+                throw RelayError.cleanupFailed("聚合设备校验失败且无法释放：\(CoreAudioFailure.describe(status))")
+            }
+            throw error
+        }
         return aggregateID
     }
 

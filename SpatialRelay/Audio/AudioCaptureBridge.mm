@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -35,6 +36,8 @@ struct CaptureStorage {
 
     bool nonInterleaved = false;
     UInt32 bytesPerFrame = 0;
+    UInt32 channels = 2;
+    UInt32 tapBufferOffset = 0;
 
     void reset() noexcept {
         readCursor.store(0, std::memory_order_release);
@@ -82,50 +85,52 @@ struct CaptureStorage {
         return writable;
     }
 
+    void configure(UInt32 channelCount, bool planar) {
+        channels = channelCount;
+        nonInterleaved = planar;
+        bytesPerFrame = sizeof(float) * (planar ? 1 : channels);
+        samples.assign(static_cast<size_t>(capacityFrames) * channels, 0.0f);
+        reset();
+    }
+
     void writeInterleaved(const float *source, UInt32 requestedFrames) noexcept {
         if (source == nullptr || requestedFrames == 0) return;
-
         const UInt64 write = writeCursor.load(std::memory_order_relaxed);
         const UInt64 read = readCursor.load(std::memory_order_acquire);
         const UInt32 frames = writableFrames(requestedFrames, write, read);
         if (frames == 0) return;
-
         const UInt32 offset = static_cast<UInt32>(write) & mask;
         const UInt32 first = std::min(frames, capacityFrames - offset);
-        std::memcpy(samples.data() + static_cast<size_t>(offset) * 2,
-                    source,
-                    static_cast<size_t>(first) * 2 * sizeof(float));
+        std::memcpy(samples.data() + static_cast<size_t>(offset) * channels,
+                    source, static_cast<size_t>(first) * channels * sizeof(float));
         if (first < frames) {
-            std::memcpy(samples.data(),
-                        source + static_cast<size_t>(first) * 2,
-                        static_cast<size_t>(frames - first) * 2 * sizeof(float));
+            std::memcpy(samples.data(), source + static_cast<size_t>(first) * channels,
+                        static_cast<size_t>(frames - first) * channels * sizeof(float));
         }
-
-        float peak = 0.0f;
-        for (UInt32 index = 0; index < frames * 2; ++index) {
-            peak = std::max(peak, std::fabs(source[index]));
+        float peak = 0;
+        for (size_t i = 0; i < static_cast<size_t>(frames) * channels; ++i) {
+            peak = std::max(peak, std::fabs(source[i]));
         }
         storePeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
     }
 
-    void writePlanar(const float *left, const float *right, UInt32 requestedFrames) noexcept {
-        if (left == nullptr || right == nullptr || requestedFrames == 0) return;
-
+    // Interleaving is a memory-layout copy, with no arithmetic on PCM samples.
+    void writePlanar(const AudioBuffer *buffers, UInt32 requestedFrames) noexcept {
         const UInt64 write = writeCursor.load(std::memory_order_relaxed);
         const UInt64 read = readCursor.load(std::memory_order_acquire);
         const UInt32 frames = writableFrames(requestedFrames, write, read);
-        if (frames == 0) return;
-
-        float peak = 0.0f;
-        for (UInt32 index = 0; index < frames; ++index) {
-            const UInt32 destination = (static_cast<UInt32>(write) + index) & mask;
-            samples[static_cast<size_t>(destination) * 2] = left[index];
-            samples[static_cast<size_t>(destination) * 2 + 1] = right[index];
-            peak = std::max(peak, std::max(std::fabs(left[index]), std::fabs(right[index])));
+        float peak = 0;
+        for (UInt32 frame = 0; frame < frames; ++frame) {
+            const UInt32 destination = (static_cast<UInt32>(write) + frame) & mask;
+            for (UInt32 channel = 0; channel < channels; ++channel) {
+                const float *source = static_cast<const float *>(buffers[channel].mData);
+                std::memcpy(&samples[static_cast<size_t>(destination) * channels + channel],
+                            source + frame, sizeof(float));
+                peak = std::max(peak, std::fabs(source[frame]));
+            }
         }
-
         storePeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
@@ -144,12 +149,12 @@ struct CaptureStorage {
         const UInt32 offset = static_cast<UInt32>(read) & mask;
         const UInt32 first = std::min(frames, capacityFrames - offset);
         std::memcpy(destination,
-                    samples.data() + static_cast<size_t>(offset) * 2,
-                    static_cast<size_t>(first) * 2 * sizeof(float));
+                    samples.data() + static_cast<size_t>(offset) * channels,
+                    static_cast<size_t>(first) * channels * sizeof(float));
         if (first < frames) {
-            std::memcpy(destination + static_cast<size_t>(first) * 2,
+            std::memcpy(destination + static_cast<size_t>(first) * channels,
                         samples.data(),
-                        static_cast<size_t>(frames - first) * 2 * sizeof(float));
+                        static_cast<size_t>(frames - first) * channels * sizeof(float));
         }
 
         readCursor.store(read + frames, std::memory_order_release);
@@ -170,60 +175,121 @@ OSStatus captureIOProc(AudioObjectID,
                        const AudioTimeStamp *,
                        const AudioBufferList *inputData,
                        const AudioTimeStamp *,
-                       AudioBufferList *,
+                       AudioBufferList *outputData,
                        const AudioTimeStamp *,
                        void *clientData) noexcept {
-    auto *state = static_cast<CaptureStorage *>(clientData);
-    if (state == nullptr) {
-        return noErr;
+    // Never produce audio through the aggregate; AVFoundation owns playback.
+    if (outputData != nullptr) {
+        for (UInt32 i = 0; i < outputData->mNumberBuffers; ++i) {
+            if (outputData->mBuffers[i].mData != nullptr) {
+                std::memset(outputData->mBuffers[i].mData, 0, outputData->mBuffers[i].mDataByteSize);
+            }
+        }
     }
+    auto *state = static_cast<CaptureStorage *>(clientData);
+    if (state == nullptr) return noErr;
     state->callbacks.fetch_add(1, std::memory_order_relaxed);
-
     if (inputData == nullptr || inputData->mNumberBuffers == 0) return noErr;
 
-    if (state->nonInterleaved) {
-        if (inputData->mNumberBuffers != 2) {
-            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
-            return noErr;
-        }
-
-        const AudioBuffer &leftBuffer = inputData->mBuffers[0];
-        const AudioBuffer &rightBuffer = inputData->mBuffers[1];
-        if (leftBuffer.mDataByteSize == 0 && rightBuffer.mDataByteSize == 0) return noErr;
-        if (leftBuffer.mNumberChannels != 1 ||
-            rightBuffer.mNumberChannels != 1 ||
-            !isFloatAligned(leftBuffer.mData) ||
-            !isFloatAligned(rightBuffer.mData) ||
-            leftBuffer.mDataByteSize != rightBuffer.mDataByteSize ||
-            leftBuffer.mDataByteSize % sizeof(float) != 0) {
-            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
-            return noErr;
-        }
-
-        const UInt32 byteCount = leftBuffer.mDataByteSize;
-        const UInt32 frameCount = byteCount / sizeof(float);
-        state->writePlanar(static_cast<const float *>(leftBuffer.mData),
-                           static_cast<const float *>(rightBuffer.mData),
-                           frameCount);
-    } else {
-        if (inputData->mNumberBuffers != 1) {
-            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
-            return noErr;
-        }
-        const AudioBuffer &buffer = inputData->mBuffers[0];
-        if (buffer.mDataByteSize == 0) return noErr;
-        if (buffer.mNumberChannels != 2 ||
-            !isFloatAligned(buffer.mData) ||
-            state->bytesPerFrame == 0 ||
-            buffer.mDataByteSize % state->bytesPerFrame != 0) {
-            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
-            return noErr;
-        }
-
-        const UInt32 frameCount = buffer.mDataByteSize / state->bytesPerFrame;
-        state->writeInterleaved(static_cast<const float *>(buffer.mData), frameCount);
+    const UInt32 required = state->nonInterleaved ? state->channels : 1;
+    if (inputData->mNumberBuffers != state->tapBufferOffset + required) {
+        state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
+        return noErr;
     }
+    // Physical input streams are disabled before AudioDeviceStart. Their buffers
+    // must remain NULL; never copy or inspect microphone sample data.
+    for (UInt32 i = 0; i < state->tapBufferOffset; ++i) {
+        if (inputData->mBuffers[i].mData != nullptr) {
+            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
+            return noErr;
+        }
+    }
+    const AudioBuffer *buffers = &inputData->mBuffers[state->tapBufferOffset];
+    if (buffers[0].mDataByteSize == 0) return noErr;
+    if (state->nonInterleaved) {
+        for (UInt32 channel = 0; channel < state->channels; ++channel) {
+            if (buffers[channel].mNumberChannels != 1 ||
+                !isFloatAligned(buffers[channel].mData) ||
+                buffers[channel].mDataByteSize != buffers[0].mDataByteSize ||
+                buffers[channel].mDataByteSize % sizeof(float) != 0) {
+                state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
+                return noErr;
+            }
+        }
+        state->writePlanar(buffers, buffers[0].mDataByteSize / sizeof(float));
+    } else {
+        if (buffers[0].mNumberChannels != state->channels ||
+            !isFloatAligned(buffers[0].mData) || state->bytesPerFrame == 0 ||
+            buffers[0].mDataByteSize % state->bytesPerFrame != 0) {
+            state->formatMismatches.fetch_add(1, std::memory_order_relaxed);
+            return noErr;
+        }
+        state->writeInterleaved(static_cast<const float *>(buffers[0].mData),
+                               buffers[0].mDataByteSize / state->bytesPerFrame);
+    }
+    return noErr;
+}
 
+// Enable ONLY the final input stream (the sole process tap), no physical input
+// and no aggregate output. Verify HAL readback before any callback can run.
+OSStatus configureStreamUsage(AudioObjectID device, AudioDeviceIOProcID ioProc,
+                              AudioObjectPropertyScope scope, bool finalInputOnly) {
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyStreams, scope, kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(device, &address, 0, nullptr, &size);
+    if (status != noErr) return status;
+    const UInt32 count = size / sizeof(AudioStreamID);
+    if (count == 0) return finalInputOnly ? kAudioHardwareBadStreamError : noErr;
+    const size_t usageSize = offsetof(AudioHardwareIOProcStreamUsage, mStreamIsOn) +
+        static_cast<size_t>(count) * sizeof(UInt32);
+    std::vector<std::max_align_t> memory((usageSize + sizeof(std::max_align_t) - 1) /
+                                       sizeof(std::max_align_t));
+    auto *usage = reinterpret_cast<AudioHardwareIOProcStreamUsage *>(memory.data());
+    usage->mIOProc = reinterpret_cast<void *>(ioProc);
+    usage->mNumberStreams = count;
+    for (UInt32 i = 0; i < count; ++i) usage->mStreamIsOn[i] = finalInputOnly && i == count - 1 ? 1 : 0;
+    address.mSelector = kAudioDevicePropertyIOProcStreamUsage;
+    status = AudioObjectSetPropertyData(device, &address, 0, nullptr,
+                                       static_cast<UInt32>(usageSize), usage);
+    if (status != noErr) return status;
+    UInt32 readSize = static_cast<UInt32>(usageSize);
+    status = AudioObjectGetPropertyData(device, &address, 0, nullptr, &readSize, usage);
+    if (status != noErr) return status;
+    if (usage->mNumberStreams != count) return kAudioHardwareBadStreamError;
+    for (UInt32 i = 0; i < count; ++i) {
+        if ((usage->mStreamIsOn[i] != 0) != (finalInputOnly && i == count - 1)) {
+            return kAudioHardwareIllegalOperationError;
+        }
+    }
+    return noErr;
+}
+
+OSStatus tapBufferOffset(AudioObjectID device, const AudioStreamBasicDescription &format,
+                         UInt32 *offset) {
+    AudioObjectPropertyAddress address = {
+        kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(device, &address, 0, nullptr, &size);
+    if (status != noErr) return status;
+    if (size < sizeof(AudioBufferList)) return kAudioHardwareBadStreamError;
+    std::vector<std::max_align_t> memory((size + sizeof(std::max_align_t) - 1) /
+                                       sizeof(std::max_align_t));
+    auto *list = reinterpret_cast<AudioBufferList *>(memory.data());
+    status = AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, list);
+    if (status != noErr) return status;
+    const bool planar = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    const UInt32 required = planar ? format.mChannelsPerFrame : 1;
+    if (list->mNumberBuffers < required) return kAudioHardwareBadStreamError;
+    *offset = list->mNumberBuffers - required;
+    for (UInt32 i = *offset; i < list->mNumberBuffers; ++i) {
+        if (list->mBuffers[i].mNumberChannels != (planar ? 1 : format.mChannelsPerFrame)) {
+            return kAudioHardwareBadStreamError;
+        }
+    }
     return noErr;
 }
 
@@ -336,9 +402,9 @@ NSError *captureError(NSString *operation, OSStatus status) {
         (format.mFormatFlags & kAudioFormatFlagIsPacked) != 0 &&
         (format.mFormatFlags & kAudioFormatFlagIsBigEndian) == 0;
     const bool nonInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-    const UInt32 expectedBytesPerFrame = nonInterleaved ? sizeof(float) : sizeof(float) * 2;
-    const bool isStereoFloat32 = isFloatPCM &&
-        format.mChannelsPerFrame == 2 &&
+    const UInt32 expectedBytesPerFrame = sizeof(float) * (nonInterleaved ? 1 : format.mChannelsPerFrame);
+    const bool isSupportedFloat32 = isFloatPCM &&
+        format.mChannelsPerFrame >= 1 && format.mChannelsPerFrame <= 32 &&
         format.mBitsPerChannel == 32 &&
         std::isfinite(format.mSampleRate) &&
         format.mSampleRate > 0 &&
@@ -346,10 +412,10 @@ NSError *captureError(NSString *operation, OSStatus status) {
         format.mBytesPerFrame == expectedBytesPerFrame &&
         format.mBytesPerPacket == expectedBytesPerFrame &&
         format.mReserved == 0;
-    if (!isStereoFloat32) {
+    if (!isSupportedFloat32) {
         if (error != nullptr) {
             NSString *description = [NSString stringWithFormat:
-                @"Expected packed native-endian stereo Float32 PCM; received format '%c%c%c%c', flags 0x%08x, %u channels, %u bits, %u bytes/frame, %u frames/packet at %.3f Hz.",
+                @"Expected packed native-endian 1–32 channel Float32 PCM; received format '%c%c%c%c', flags 0x%08x, %u channels, %u bits, %u bytes/frame, %u frames/packet at %.3f Hz.",
                 static_cast<char>((format.mFormatID >> 24) & 0xff),
                 static_cast<char>((format.mFormatID >> 16) & 0xff),
                 static_cast<char>((format.mFormatID >> 8) & 0xff),
@@ -368,9 +434,12 @@ NSError *captureError(NSString *operation, OSStatus status) {
     }
 
     auto *state = storage(self);
-    state->reset();
-    state->nonInterleaved = nonInterleaved;
-    state->bytesPerFrame = expectedBytesPerFrame;
+    state->configure(format.mChannelsPerFrame, nonInterleaved);
+    OSStatus layoutStatus = tapBufferOffset(deviceID, format, &state->tapBufferOffset);
+    if (layoutStatus != noErr) {
+        if (error != nullptr) *error = captureError(@"验证捕获缓冲布局", layoutStatus);
+        return NO;
+    }
 
     AudioDeviceIOProcID ioProcID = nullptr;
     OSStatus status = AudioDeviceCreateIOProcID(deviceID,
@@ -384,6 +453,16 @@ NSError *captureError(NSString *operation, OSStatus status) {
 
     _deviceID = deviceID;
     _ioProcID = ioProcID;
+    status = configureStreamUsage(deviceID, ioProcID, kAudioDevicePropertyScopeInput, true);
+    if (status == noErr) {
+        status = configureStreamUsage(deviceID, ioProcID, kAudioDevicePropertyScopeOutput, false);
+    }
+    if (status != noErr) {
+        NSError *cleanupError = nil;
+        [self stopWithError:&cleanupError];
+        if (error != nullptr) *error = cleanupError ?: captureError(@"禁用物理输入与聚合输出", status);
+        return NO;
+    }
     // Set this before AudioDeviceStart. If start reports an error after doing
     // partial work, cleanup will still make a conservative stop attempt.
     _ioProcMayBeRunning = YES;
@@ -480,23 +559,35 @@ NSError *captureError(NSString *operation, OSStatus status) {
     const UInt32 requested = std::min(maximumFrameCount, available);
     if (requested == 0) return nil;
 
-    NSMutableData *data = [NSMutableData dataWithLength:static_cast<NSUInteger>(requested) * 2 * sizeof(float)];
+    NSMutableData *data = [NSMutableData dataWithLength:static_cast<NSUInteger>(requested) * state->channels * sizeof(float)];
     const UInt32 actual = state->readInterleaved(static_cast<float *>(data.mutableBytes), requested);
     if (actual == 0) return nil;
     if (actual < requested) {
-        data.length = static_cast<NSUInteger>(actual) * 2 * sizeof(float);
+        data.length = static_cast<NSUInteger>(actual) * state->channels * sizeof(float);
     }
     return [[SRPCMChunk alloc] initWithData:data frameCount:actual];
 }
 
 #if DEBUG
+- (void)debugConfigureChannels:(UInt32)channels planar:(BOOL)planar tapBufferOffset:(UInt32)offset {
+    if (_ioProcMayBeRunning || channels == 0 || channels > 32) return;
+    auto *state = storage(self);
+    state->configure(channels, planar);
+    state->tapBufferOffset = offset;
+}
+
+- (void)debugEnqueueBufferList:(const AudioBufferList *)buffers {
+    if (_ioProcMayBeRunning) return;
+    captureIOProc(0, nullptr, buffers, nullptr, nullptr, nullptr, storage(self));
+}
+
 - (void)debugEnqueueInterleavedFloatData:(NSData *)data {
     auto *state = storage(self);
     if (_ioProcMayBeRunning ||
         state == nullptr ||
         !isFloatAligned(data.bytes) ||
-        data.length % (2 * sizeof(float)) != 0) return;
-    const UInt32 frames = static_cast<UInt32>(data.length / (2 * sizeof(float)));
+        data.length % (state->channels * sizeof(float)) != 0) return;
+    const UInt32 frames = static_cast<UInt32>(data.length / (state->channels * sizeof(float)));
     state->writeInterleaved(static_cast<const float *>(data.bytes), frames);
 }
 #endif

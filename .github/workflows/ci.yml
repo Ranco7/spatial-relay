@@ -1,9 +1,8 @@
-name: CI
+name: Background relay verification
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -11,75 +10,100 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: background-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    name: Build and test
     runs-on: macos-15
     timeout-minutes: 20
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-
+    permissions:
+      contents: write
     steps:
       - name: Check out source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-
-      - name: Show toolchain
+      - name: Show native toolchain
         run: |
+          uname -m
           xcodebuild -version
           swift --version
-
-      - name: Run unit tests
+          test "$(uname -m)" = arm64
+      - name: Test PCM, process boundaries and recovery
         run: |
-          xcodebuild -quiet \
-            -project SpatialRelay.xcodeproj \
-            -scheme SpatialRelay \
-            -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
-            -resultBundlePath "$RUNNER_TEMP/SpatialRelayTests.xcresult" \
-            ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO \
-            test
-
-      - name: Run static analysis
+          xcodebuild -quiet -project SpatialRelay.xcodeproj -scheme SpatialRelay \
+            -configuration Debug -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/TestBuild" \
+            -resultBundlePath "$RUNNER_TEMP/Tests.xcresult" \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO test
+      - name: Analyze native source
         run: |
-          xcodebuild -quiet \
-            -project SpatialRelay.xcodeproj \
-            -scheme SpatialRelay \
-            -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
-            ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO \
-            analyze
-
-      - name: Build Release configuration
+          xcodebuild -quiet -project SpatialRelay.xcodeproj -scheme SpatialRelay \
+            -configuration Debug -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/TestBuild" \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO analyze
+      - name: Build and sign installation package
+        env:
+          SPATIAL_RELAY_BUILD_DIR: ${{ runner.temp }}/ReleaseBuild
+          SPATIAL_RELAY_DIST_DIR: ${{ runner.temp }}/dist
+        run: bash Scripts/package-background.sh
+      - name: Run binary and package smoke checks
+        shell: bash
         run: |
-          xcodebuild -quiet \
-            -project SpatialRelay.xcodeproj \
-            -scheme SpatialRelay \
-            -configuration Release \
-            -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-          lipo \
-            "$RUNNER_TEMP/SpatialRelayDerivedData/Build/Products/Release/SpatialRelay.app/Contents/MacOS/SpatialRelay" \
-            -verify_arch arm64
-
-      - name: Upload failed test result
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          set -euo pipefail
+          PACKAGE="$RUNNER_TEMP/dist/SpatialRelay"
+          BINARY="$PACKAGE/SpatialRelay.app/Contents/MacOS/SpatialRelay"
+          "$BINARY" --help
+          "$BINARY" --diagnose > "$RUNNER_TEMP/diagnosis.json"
+          "$BINARY" --check-config --config "$PACKAGE/Configuration/config.json"
+          if "$BINARY" --invalid-argument; then exit 1; fi
+          printf '{"targetBundleIDs":[]}' > "$RUNNER_TEMP/bad-config.json"
+          if "$BINARY" --check-config --config "$RUNNER_TEMP/bad-config.json"; then exit 1; fi
+          printf '{"targetBundleIDs":["com.example.IntentionallyAbsent"]}' > "$RUNNER_TEMP/idle-config.json"
+          "$BINARY" --config "$RUNNER_TEMP/idle-config.json" > "$RUNNER_TEMP/idle.log" 2>&1 &
+          RELAY_TEST_PID=$!
+          trap 'kill -TERM "$RELAY_TEST_PID" 2>/dev/null || true' EXIT
+          sleep 5
+          kill -0 "$RELAY_TEST_PID"
+          "$BINARY" --status > "$RUNNER_TEMP/idle-status.json"
+          test "$(plutil -extract active raw -o - "$RUNNER_TEMP/idle-status.json")" = false
+          test "$(plutil -extract capturedFrames raw -o - "$RUNNER_TEMP/idle-status.json")" = 0
+          kill -TERM "$RELAY_TEST_PID"
+          wait "$RELAY_TEST_PID"
+          trap - EXIT
+          for script in Scripts/*.sh *.command; do bash -n "$script"; done
+          export SPATIAL_RELAY_SUPPORT_DIR="$RUNNER_TEMP/InstallTest/Support"
+          export SPATIAL_RELAY_AGENT_DIR="$RUNNER_TEMP/InstallTest/Agents"
+          export SPATIAL_RELAY_TRASH_DIR="$RUNNER_TEMP/InstallTest/Trash"
+          export SPATIAL_RELAY_INSTALL_TEST_ONLY=1
+          bash "$PACKAGE/Scripts/install.sh"
+          test -x "$SPATIAL_RELAY_SUPPORT_DIR/SpatialRelay.app/Contents/MacOS/SpatialRelay"
+          if bash "$PACKAGE/Scripts/install.sh"; then exit 1; fi
+          bash "$PACKAGE/Scripts/uninstall.sh"
+          test ! -e "$SPATIAL_RELAY_SUPPORT_DIR"
+          test -d "$SPATIAL_RELAY_TRASH_DIR"
+      - name: Upload evidence and executable package
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: SpatialRelayTests-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/SpatialRelayTests.xcresult
-          if-no-files-found: ignore
-          retention-days: 7
+          name: SpatialRelay-arm64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/dist/*.zip
+            ${{ runner.temp }}/dist/*.sha256
+            ${{ runner.temp }}/diagnosis.json
+            ${{ runner.temp }}/idle-status.json
+            ${{ runner.temp }}/Tests.xcresult
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Publish tested prerelease
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "background-${GITHUB_SHA:0:12}" \
+            "$RUNNER_TEMP/dist/SpatialRelay-0.3.0-arm64.zip" \
+            "$RUNNER_TEMP/dist/SpatialRelay-0.3.0-arm64.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "空间音频桥 0.3.0 · ${GITHUB_SHA:0:7}" \
+            --notes "默认自动接管网易云音乐与 Chrome，无图标与窗口。云端构建和自动检查已通过；AirPods 系统面板与长期播放仍待实机验收。安装包为临时签名，未公证。"

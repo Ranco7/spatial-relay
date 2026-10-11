@@ -2,7 +2,7 @@ import CoreAudio
 import Foundation
 
 struct RelayDiscovery: Sendable {
-    let spotifyProcesses: [AudioProcessInfo]
+    let targetProcesses: [AudioProcessInfo]
     let outputDevice: OutputDeviceInfo?
 }
 
@@ -10,10 +10,14 @@ struct RelayMetrics: Sendable {
     let peakLevel: Float
     let bufferedMilliseconds: Double
     let droppedFrameCount: UInt64
+    let capturedFrameCount: UInt64
+    let callbackCount: UInt64
+    let formatMismatchCount: UInt64
 }
 
 final class AudioRelayCoordinator: @unchecked Sendable {
-    private let hardware = AudioHardwareClient()
+    private let hardware: AudioHardwareClient
+    private var generation: UInt64 = 0
     private let controlQueue = DispatchQueue(label: "com.shevlfs.SpatialRelay.audio-coordinator")
     private let controlQueueKey = DispatchSpecificKey<UInt8>()
 
@@ -30,7 +34,8 @@ final class AudioRelayCoordinator: @unchecked Sendable {
 
     private var isActive = false
 
-    init() {
+    init(configuration: RelayConfiguration = RelayConfiguration()) {
+        hardware = AudioHardwareClient(configuration: configuration)
         controlQueue.setSpecific(key: controlQueueKey, value: 1)
     }
 
@@ -41,7 +46,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     func discover() throws -> RelayDiscovery {
         try performSync {
             RelayDiscovery(
-                spotifyProcesses: try hardware.spotifyProcesses(),
+                targetProcesses: try hardware.targetProcesses(),
                 outputDevice: try? hardware.defaultOutputDevice()
             )
         }
@@ -64,13 +69,13 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         #endif
 
         let output = try hardware.defaultOutputDevice()
-        let processes = try hardware.spotifyProcesses()
+        let processes = try hardware.targetProcesses()
         guard !processes.isEmpty else {
-            throw RelayError.spotifyNotRunning
+            throw RelayError.targetNotRunning
         }
 
         do {
-            tapID = try hardware.createSpotifyTap(processes: processes, outputDevice: output)
+            tapID = try hardware.createTargetTap(processes: processes, outputDevice: output)
             let format = try hardware.tapFormat(tapID)
             guard abs(format.mSampleRate - output.sampleRate) <= 0.5 else {
                 throw RelayError.unsupportedTapFormat(
@@ -78,19 +83,22 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 )
             }
             let uid = try hardware.tapUID(tapID)
-            aggregateID = try hardware.createAggregateDevice(tapUID: uid)
+            aggregateID = try hardware.createAggregateDevice(tapUID: uid, output: output)
 
+            let callbackGeneration = generation
             let capture = SRAudioCaptureBridge()
             let player = try SampleBufferPlayer(
                 capture: capture,
                 sampleRate: format.mSampleRate,
-                outputDeviceUID: output.uid
+                outputDeviceUID: output.uid,
+                channelCount: format.mChannelsPerFrame,
+                channelLayout: try hardware.channelLayout(output: output, channels: format.mChannelsPerFrame)
             ) { [weak self] error in
                 guard let self else { return }
                 self.controlQueue.async { [weak self] in
-                    guard let self, self.isActive else { return }
+                    guard let self, self.isActive, self.generation == callbackGeneration else { return }
                     // Flush playback before stopping the tap, then immediately release
-                    // mutedWhenTapped so Spotify's direct output is restored.
+                    // mutedWhenTapped so 目标应用's direct output is restored.
                     let cleanupFailure = self.stopPipeline()
                     DispatchQueue.main.async {
                         onFailure(cleanupFailure ?? error)
@@ -116,7 +124,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             sampleRateMismatchStartTime = nil
             isActive = true
 
-            return RelayDiscovery(spotifyProcesses: processes, outputDevice: output)
+            return RelayDiscovery(targetProcesses: processes, outputDevice: output)
         } catch {
             let startupFailure = error
             if let cleanupFailure = tearDownPipeline() {
@@ -135,19 +143,23 @@ final class AudioRelayCoordinator: @unchecked Sendable {
 
     private func stopPipeline() -> Error? {
         isActive = false
+        generation &+= 1
         return tearDownPipeline()
     }
 
     func metrics() -> RelayMetrics {
         performSync {
             guard let capture, activeSampleRate > 0 else {
-                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0)
+                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0, capturedFrameCount: 0, callbackCount: 0, formatMismatchCount: 0)
             }
             let buffered = Double(capture.availableFrameCount) / activeSampleRate * 1_000
             return RelayMetrics(
                 peakLevel: capture.peakLevel,
                 bufferedMilliseconds: buffered,
-                droppedFrameCount: capture.droppedFrameCount
+                droppedFrameCount: capture.droppedFrameCount,
+                capturedFrameCount: capture.capturedFrameCount,
+                callbackCount: capture.callbackCount,
+                formatMismatchCount: capture.formatMismatchCount
             )
         }
     }
@@ -190,16 +202,14 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 sampleRateMismatchStartTime = nil
             }
 
-            let processes = try hardware.spotifyProcesses()
+            let processes = try hardware.targetProcesses()
             let processIDs = Set(processes.map(\.id))
-            if activeProcessIDs.isDisjoint(with: processIDs) {
-                return RelayError.captureFailed("Spotify replaced its audio process")
+            guard !processIDs.isEmpty else { return RelayError.targetNotRunning }
+            if processIDs != activeProcessIDs {
+                try hardware.updateTapProcesses(tapID, processes: processes)
+                activeProcessIDs = processIDs
             }
-
             let runningOutputIDs = Set(processes.filter(\.isRunningOutput).map(\.id))
-            if !runningOutputIDs.isEmpty && !runningOutputIDs.isSubset(of: activeProcessIDs) {
-                return RelayError.captureFailed("Spotify moved playback to a new audio process")
-            }
 
             if !runningOutputIDs.isEmpty, let capture {
                 let capturedFrameCount = capture.capturedFrameCount
@@ -233,7 +243,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
 
     private func tearDownPipeline() -> Error? {
         // Order matters: discard queued relay audio, stop reading (which un-mutes
-        // Spotify), then destroy the aggregate device and process tap.
+        // 目标应用), then destroy the aggregate device and process tap.
         var cleanupProblems: [String] = []
 
         player?.stop()

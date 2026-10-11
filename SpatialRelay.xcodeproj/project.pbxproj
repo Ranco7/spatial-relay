@@ -225,8 +225,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				B00000000000000000000001 /* SpatialRelayApp.swift in Sources */,
-				B00000000000000000000002 /* ContentView.swift in Sources */,
-				B00000000000000000000003 /* RelayViewModel.swift in Sources */,
 				B00000000000000000000004 /* CoreAudioSupport.swift in Sources */,
 				B00000000000000000000005 /* AudioHardwareClient.swift in Sources */,
 				B00000000000000000000006 /* RelayError.swift in Sources */,
@@ -371,7 +369,7 @@
 				CODE_SIGN_ENTITLEMENTS = SpatialRelay/SpatialRelay.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -383,8 +381,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
-				MARKETING_VERSION = 0.2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.shevlfs.SpatialRelay;
+				MARKETING_VERSION = 0.3.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ranco7.SpatialRelay;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "SpatialRelay/SpatialRelay-Bridging-Header.h";
@@ -401,7 +399,7 @@
 				CODE_SIGN_ENTITLEMENTS = SpatialRelay/SpatialRelay.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -412,8 +410,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
-				MARKETING_VERSION = 0.2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.shevlfs.SpatialRelay;
+				MARKETING_VERSION = 0.3.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ranco7.SpatialRelay;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "SpatialRelay/SpatialRelay-Bridging-Header.h";
@@ -432,7 +430,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.shevlfs.SpatialRelayTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ranco7.SpatialRelayTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_STRICT_CONCURRENCY = minimal;
 				SWIFT_VERSION = 5.0;
@@ -450,7 +448,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.shevlfs.SpatialRelayTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ranco7.SpatialRelayTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_STRICT_CONCURRENCY = minimal;
 				SWIFT_VERSION = 5.0;

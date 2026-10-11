@@ -4,49 +4,109 @@ import XCTest
 @testable import SpatialRelay
 
 final class CoreLogicTests: XCTestCase {
-    func testSpotifyProcessMatcherAcceptsMainAppAndHelpers() {
-        XCTAssertTrue(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "com.spotify.client",
-                applicationName: "Spotify"
-            )
-        )
-        XCTAssertTrue(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "com.spotify.client.helper",
-                applicationName: "Spotify Helper (Renderer)"
-            )
-        )
+    func testFamilyMatcherIncludesNetEaseChromeAndHelpersOnly() {
+        let targets = RelayConfiguration().targetBundleIDs
+        for bundle in ["com.netease.163music", "com.netease.163music.helper",
+                       "com.google.Chrome", "com.google.Chrome.helper.Renderer"] {
+            XCTAssertTrue(AppFamilyMatcher.matches(bundleIdentifier: bundle, owningAppBundleIdentifier: nil, targets: targets))
+        }
+        for bundle in ["com.apple.Safari", "com.google.ChromeCanary",
+                       "com.netease.163musicx", "", "com.ranco7.SpatialRelay"] {
+            XCTAssertFalse(AppFamilyMatcher.matches(bundleIdentifier: bundle, owningAppBundleIdentifier: nil, targets: targets))
+        }
     }
 
-    func testSpotifyProcessMatcherRejectsUnrelatedAudioApps() {
-        XCTAssertFalse(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "com.apple.Safari",
-                applicationName: "Safari"
-            )
-        )
-        XCTAssertFalse(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "com.example.notspotify",
-                applicationName: "Not Spotify"
-            )
-        )
-        XCTAssertFalse(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "com.example.audio",
-                applicationName: "Spotify"
-            )
-        )
+    func testFamilyMatcherUsesOwningAppForDifferentlyNamedHelpers() {
+        let targets = RelayConfiguration().targetBundleIDs
+        XCTAssertTrue(AppFamilyMatcher.matches(bundleIdentifier: "org.chromium.utility",
+            owningAppBundleIdentifier: "com.google.Chrome", targets: targets))
+        XCTAssertTrue(AppFamilyMatcher.matches(bundleIdentifier: "",
+            owningAppBundleIdentifier: "com.netease.163music", targets: targets))
+        XCTAssertFalse(AppFamilyMatcher.matches(bundleIdentifier: "com.google.Chrome.helper",
+            owningAppBundleIdentifier: "com.example.Other", targets: targets))
+        let path = "/Applications/Google Chrome.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper"
+        XCTAssertEqual(AppFamilyMatcher.outerAppURL(executablePath: path)?.path, "/Applications/Google Chrome.app")
+        XCTAssertNil(AppFamilyMatcher.outerAppURL(executablePath: "/usr/bin/afplay"))
     }
 
-    func testSpotifyProcessMatcherUsesNameOnlyWhenBundleIdentifierIsUnavailable() {
-        XCTAssertTrue(
-            SpotifyProcessMatcher.matches(
-                bundleIdentifier: "",
-                applicationName: "Spotify Helper (Renderer)"
-            )
-        )
+    func testConfigurationAndRetryAreBounded() throws {
+        XCTAssertEqual(RelayConfiguration().targetBundleIDs, ["com.netease.163music", "com.google.Chrome"])
+        XCTAssertNoThrow(try RelayConfiguration().validated())
+        var config = RelayConfiguration()
+        config.targetBundleIDs = []
+        XCTAssertThrowsError(try config.validated())
+        config.targetBundleIDs = ["com.ranco7.SpatialRelay"]
+        XCTAssertThrowsError(try config.validated())
+        config.targetBundleIDs = ["com.google.Chrome "]
+        XCTAssertThrowsError(try config.validated())
+        var retry = RetryBackoff()
+        XCTAssertEqual((0..<8).map { _ in retry.nextDelay() }, [5, 10, 20, 40, 60, 60, 60, 60])
+        retry.reset()
+        XCTAssertEqual(retry.nextDelay(), 5)
+    }
+
+    func testPCMFactoryPreservesInterleavedMonoAndStereoBits() throws {
+        for channels: UInt32 in [1, 2] {
+            let bits: [UInt32] = channels == 1 ?
+                [0x80000000, 0x00000001, 0x3f123456] :
+                [0x80000000, 0x00000001, 0x3f123456, 0xbf654321]
+            let data = bits.withUnsafeBytes { Data($0) }
+            let factory = try PCMSampleBufferFactory(sampleRate: 48_000, channelCount: channels, channelLayout: nil)
+            let sample = try factory.makeSampleBuffer(data: data,
+                frameCount: UInt32(bits.count) / channels, startingAtFrame: 0)
+            let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+            var output = Data(count: data.count)
+            let status = output.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: data.count, destination: $0.baseAddress!)
+            }
+            XCTAssertEqual(status, noErr)
+            XCTAssertEqual(data, output)
+            XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(sample), .zero)
+        }
+        XCTAssertThrowsError(try PCMSampleBufferFactory(sampleRate: 48_000, channelCount: 6, channelLayout: nil))
+    }
+
+    func testMonoAndSixChannelRingPreserveEveryByte() throws {
+        for channels: UInt32 in [1, 6] {
+            let bridge = SRAudioCaptureBridge()
+            bridge.debugConfigureChannels(channels, planar: false, tapBufferOffset: 0)
+            let bits = (0..<Int(channels * 4)).map { UInt32($0) &+ 0x3e800000 }
+            let input = bits.withUnsafeBytes { Data($0) }
+            bridge.debugEnqueueInterleavedFloat(input)
+            let chunk = try XCTUnwrap(bridge.dequeueChunk(withMaximumFrameCount: 4))
+            XCTAssertEqual(chunk.frameCount, 4)
+            XCTAssertEqual(chunk.data, input)
+        }
+    }
+
+    func testPlanarTapIgnoresPhysicalInputAndCopiesStereoBits() throws {
+        let bridge = SRAudioCaptureBridge()
+        bridge.debugConfigureChannels(2, planar: true, tapBufferOffset: 1)
+        var left: [UInt32] = [0x80000000, 0x3f123456]
+        var right: [UInt32] = [0x00000001, 0xbf654321]
+        let size = MemoryLayout<AudioBufferList>.size + 2 * MemoryLayout<AudioBuffer>.stride
+        let pointer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { pointer.deallocate() }
+        pointer.initializeMemory(as: UInt8.self, repeating: 0, count: size)
+        let list = pointer.bindMemory(to: AudioBufferList.self, capacity: 1)
+        list.pointee.mNumberBuffers = 3
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        buffers[0] = AudioBuffer(mNumberChannels: 1, mDataByteSize: 8, mData: nil)
+        left.withUnsafeMutableBytes { l in
+            right.withUnsafeMutableBytes { r in
+                buffers[1] = AudioBuffer(mNumberChannels: 1, mDataByteSize: 8, mData: l.baseAddress)
+                buffers[2] = AudioBuffer(mNumberChannels: 1, mDataByteSize: 8, mData: r.baseAddress)
+                bridge.debugEnqueueBufferList(list)
+                // Any enabled physical input invalidates the entire callback.
+                buffers[0].mData = l.baseAddress
+                bridge.debugEnqueueBufferList(list)
+            }
+        }
+        let chunk = try XCTUnwrap(bridge.dequeueChunk(withMaximumFrameCount: 4))
+        let expected: [UInt32] = [left[0], right[0], left[1], right[1]]
+        XCTAssertEqual(chunk.data, expected.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(bridge.formatMismatchCount, 1)
+        XCTAssertEqual(bridge.capturedFrameCount, 2)
     }
 
     func testAirPodsOutputDetectionIsCaseInsensitive() {
@@ -197,7 +257,7 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testApplicationBundleContainsStablePrivacyIdentity() {
-        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.shevlfs.SpatialRelay")
+        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.ranco7.SpatialRelay")
         XCTAssertNotNil(Bundle.main.object(forInfoDictionaryKey: "NSAudioCaptureUsageDescription"))
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundlePackageType") as? String, "APPL")
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") as? String, "AppIcon")

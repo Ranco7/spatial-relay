@@ -2,9 +2,9 @@ import Foundation
 
 enum RelayError: LocalizedError {
     case unsupportedMac
-    case spotifyNotRunning
-    case spotifyNotProducingAudio
+    case targetNotRunning
     case noOutputDevice
+    case configuration(String)
     case unsupportedTapFormat(String)
     case rendererFailed(String)
     case captureFailed(String)
@@ -13,21 +13,21 @@ enum RelayError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedMac:
-            "Spatial Audio on Mac requires Apple silicon."
-        case .spotifyNotRunning:
-            "Spotify is not connected to the Mac audio system. Open Spotify and start a song, then refresh."
-        case .spotifyNotProducingAudio:
-            "Spotify is open but no active output stream was found. Start playback, then try again."
+            "系统空间音频需要 Apple Silicon Mac。"
+        case .targetNotRunning:
+            "等待指定应用连接到音频系统。"
         case .noOutputDevice:
-            "macOS has no default audio output device."
+            "等待音频输出设备。"
+        case .configuration(let detail):
+            "配置有误，已停止接管：\(detail)"
         case .unsupportedTapFormat(let detail):
-            "Spotify produced an audio format this relay cannot handle (\(detail))."
+            "音频格式不支持，已保留应用原声：\(detail)"
         case .rendererFailed(let detail):
-            "The spatial audio renderer stopped (\(detail)). Spotify output has been restored."
+            "苹果空间音频渲染器中断，正在恢复原声：\(detail)"
         case .captureFailed(let detail):
-            "Spotify audio capture failed (\(detail))."
+            "指定应用的音频捕获中断：\(detail)"
         case .cleanupFailed(let detail):
-            "Spatial Relay could not fully release the audio tap (\(detail)). It attempted to restore Spotify output; quit the app before retrying."
+            "无法完整释放音频捕获，已尝试恢复原声：\(detail)"
         }
     }
 }

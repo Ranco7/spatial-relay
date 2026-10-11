@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Spatial Relay</string>
+	<string>空间音频桥</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,7 +25,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Spatial Relay captures Spotify's outgoing audio only while relaying it for AirPods Spatial Audio. Audio is never saved.</string>
+	<string>仅捕获配置指定的网易云音乐和 Chrome 的播放音频，并交给苹果原生空间音频渲染器。音频仅在内存中流转，不保存、不上传。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
